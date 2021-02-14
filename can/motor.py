@@ -6,6 +6,7 @@ from time import sleep
 import multiprocessing as mp
 from datetime import datetime as dt
 import csv
+import os
 
 class CAN_Device:
     dev_id: int
@@ -96,16 +97,30 @@ class CAN_MotorStatus:
         # elif prev < current and self.speed_data < 0:
         #     self.turns -= 1
 
-    def get_data(self, v_filter=False):
+    def get_data(self, v_filter: int = 1):
         # velocity filtration
-        vel = self.speed_data
-        if v_filter:
-            data = np.array(self.log[-20:])
-            vel = np.mean(data[:, 1].flatten())
+        data = np.array(self.log[-v_filter:])
+        vel = np.mean(data[:, 1].flatten())
         return self.encoder_data + self.turns*self.FULL_TURN, vel
+    
+    # def _get_pos_int(self, time_stamp=0)
+    # "Returns ∫qdt, where q measured in degrees"
+    #     data = np.array(self.log)
+
+    #     time = data[:, 5].T[0]
+    #     pos = data[:, 0].T[0]
+    #     turns = data[:, 4].T[0]*self.FULL_TURN
+    #     pos = pos + turns
+
+    def reset_log(self):
+        self.log = []
     
     def write_log(self):
         name = f'MOTOR_LOG.csv'
+        try:
+            os.remove(name)
+        except Exception:
+            pass
         with open(name, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile, delimiter=',',
                             quotechar='|', quoting=csv.QUOTE_MINIMAL)
@@ -143,22 +158,37 @@ class CAN_Motor(CAN_Device):
         self.send(frame)
         self.recv_status()
     
-    def PD_control(self, Kp, Kd, q, qdot, bound = 200, v_filter=False):
+    def PD_control(self, q, qdot, Kp=10, Kd=1, Ki=0, bound = 50, v_filter=1):
+        self.send(self.MOTOR_STATUS_BASE)
+        self.recv_status()
+        qr, qdotr = self.status.get_data(v_filter=v_filter)
+        qr = self._calc_degrees(qr)
+        e = np.abs(qr - q)
+        while qdotr > 0 or e > 5:
+            qr, qdotr = self.status.get_data(v_filter=v_filter)
+            qr = self._calc_degrees(qr)
+            t = Kp*(q - qr) + Kd*(qdot - qdotr)
+            e = np.abs(qr - q)
+            self._send_n_rcv_torque(int(t), bound = bound)
+    
+    def PID_control(self, P, V, Kp=10, Kd=1, Ki=0, B = 2000, VF=1, R=1):
         self.send(self.MOTOR_STATUS_BASE)
         self.recv_status()
         i = 0
+        errors = []
+        timeline = []
+        start = time()
         while True:
-            if i %4 == 0:
-
-                # sleep(0.05)
-                qr, qdotr = self.status.get_data(v_filter=v_filter)
+            if i % R == 0:
+                qr, qdotr = self.status.get_data(v_filter=VF)
                 qr = self._calc_degrees(qr)
-                
-                t = Kp*(q - qr) + Kd*(qdot - qdotr)
+                timeline.append(time() - start)
+                errors.append(P - qr)
+                t = Kp*(P - qr) + Kd*(V - qdotr) + Ki*np.trapz(errors, x=timeline)
                 print(f'pos: {qr}, vel: {qdotr}, torque: {t}', end='')
-                self._send_n_rcv_torque(int(t), bound = bound)
+                self._send_n_rcv_torque(int(t), bound = B)
             i += 1
-            i = i//4
+
     
     def smooth_off(self, Kd=1):
         self.status.write_log()
@@ -173,6 +203,11 @@ class CAN_Motor(CAN_Device):
         sleep(1)
         self.motor_off()
         sleep(1)
+
+    def reset_log(self):
+        self.status.write_log()
+        self.status.reset_log()
+
         
 
     
